@@ -1,7 +1,10 @@
 const chromium = require("@sparticuz/chromium");
 const puppeteer = require("puppeteer-core");
 
-const CACHE_TTL = 300 * 1000;
+// ---------------------------------------------------------------------------
+// In-memory cache (per-function-instance)
+// ---------------------------------------------------------------------------
+const CACHE_TTL = 300 * 1000; // 5 minutes
 const cache = global.__weplayCache || (global.__weplayCache = new Map());
 
 function cacheGet(uid) {
@@ -18,11 +21,21 @@ function cacheSet(uid, data) {
   cache.set(uid, { ts: Date.now(), data });
 }
 
+// ---------------------------------------------------------------------------
+// Scraper
+// ---------------------------------------------------------------------------
 async function scrapeWePlay(uid) {
+  const executablePath = await chromium.executablePath();
+
+  // Fix: explicitly point Chromium to the extracted shared libs in /tmp
+  process.env.LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH
+    ? `${executablePath}:${process.env.LD_LIBRARY_PATH}`
+    : executablePath;
+
   const browser = await puppeteer.launch({
     args: chromium.args,
     defaultViewport: { width: 1280, height: 900 },
-    executablePath: await chromium.executablePath(),
+    executablePath: executablePath,
     headless: chromium.headless,
   });
 
@@ -49,6 +62,7 @@ async function scrapeWePlay(uid) {
 
     await input.click({ clickCount: 3 });
 
+    // React-safe clear
     await page.evaluate((el) => {
       const setter = Object.getOwnPropertyDescriptor(
         window.HTMLInputElement.prototype,
@@ -60,6 +74,7 @@ async function scrapeWePlay(uid) {
 
     await input.type(uid, { delay: 30 });
 
+    // React-safe events after typing
     await page.evaluate((el) => {
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -68,6 +83,7 @@ async function scrapeWePlay(uid) {
       );
     }, input);
 
+    // Try all submit candidates
     const clicked = await page.evaluate(() => {
       const xpaths = [
         "//button[contains(.,'Search')]",
@@ -102,6 +118,7 @@ async function scrapeWePlay(uid) {
       await input.press("Enter");
     }
 
+    // Wait for modal with nickname + charm
     await page.waitForFunction(
       () => {
         const nick = document.querySelector(".nickname");
@@ -116,6 +133,7 @@ async function scrapeWePlay(uid) {
       { timeout: 40000 }
     );
 
+    // Extract result
     const result = await page.evaluate(() => {
       const out = {
         nickname: "",
@@ -163,13 +181,18 @@ async function scrapeWePlay(uid) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
 module.exports = async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
 
   const query = req.query || {};
 
+  // Health check
   if (req.method === "GET" && !query.uid) {
     return res.status(200).json({
+      success: true,
       ok: true,
       service: "WePlay UID Lookup",
     });
@@ -182,15 +205,20 @@ module.exports = async (req, res) => {
     });
   }
 
+  // Parse UID
   let uid = "";
-
   if (req.method === "GET") {
     uid = String(query.uid || "").trim();
   } else {
-    const body =
-      typeof req.body === "string"
-        ? JSON.parse(req.body || "{}")
-        : req.body || {};
+    let body = req.body;
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body || "{}");
+      } catch {
+        body = {};
+      }
+    }
+    body = body || {};
     uid = String(body.uid || "").trim();
   }
 
@@ -202,8 +230,9 @@ module.exports = async (req, res) => {
   }
 
   const t0 = Date.now();
-  const cached = cacheGet(uid);
 
+  // Cache hit
+  const cached = cacheGet(uid);
   if (cached) {
     return res.status(200).json({
       success: true,
@@ -216,6 +245,7 @@ module.exports = async (req, res) => {
     });
   }
 
+  // Scrape
   try {
     const data = await scrapeWePlay(uid);
     cacheSet(uid, data);
